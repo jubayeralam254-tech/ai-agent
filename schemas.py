@@ -77,4 +77,5 @@ class QueryRequest(BaseModel):
 
 class QueryResponse(BaseModel):
     result: str
+    needs_human: bool = False  # এটা add করো
     agent_steps: Optional[List[str]] = None

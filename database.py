@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
+
 from models import Base
 
 # Load the database URL from the environment.
@@ -24,7 +25,8 @@ async_engine = create_async_engine(
     echo=False,
     pool_pre_ping=True,
     pool_size=10,
-    max_overflow=20
+    max_overflow=20,
+    connect_args={"server_settings": {"search_path": "public"}}
 )
 
 # 2. Configure the async session factory
@@ -55,5 +57,6 @@ async def init_db() -> None:
     Should be called during application startup (FastAPI lifespan event).
     """
     async with async_engine.begin() as conn:
+        await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector;"))
         # run_sync creates tables within the async context
         await conn.run_sync(Base.metadata.create_all)

@@ -57,6 +57,8 @@ async def ask_agent(
         
         return QueryResponse(
             result=agent_result["response"],
+                needs_human=agent_result["needs_human"],  # এটা add করো
+
             agent_steps=agent_result["steps"]
         )
     except Exception as e:
