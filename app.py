@@ -87,7 +87,7 @@ with st.sidebar:
     ✅ Structured LLM outputs
     ✅ Vector similarity search
     ✅ Graceful human escalation
-    ✅ Full audit trail
+ 
     """
     )
     st.divider()
