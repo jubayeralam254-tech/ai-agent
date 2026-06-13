@@ -13,11 +13,9 @@ from models import Base
 
 # Load the database URL from the environment.
 # Ensure you are using the async driver: postgresql+asyncpg://...
-DATABASE_URL = os.getenv(
-    "DATABASE_URL", 
-    "postgresql+asyncpg://postgres:jubojubo67@localhost:5432/ai_support_db"
-)
-
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL environment variable not set")
 # 1. Create the async engine
 # pool_pre_ping checks the connection validity before returning it from the pool
 async_engine = create_async_engine(
