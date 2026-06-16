@@ -11,3 +11,4 @@ langgraph
 streamlit
 requests
 python-dotenv
+pydantic[email]
