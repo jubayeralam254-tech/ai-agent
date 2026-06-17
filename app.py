@@ -19,7 +19,7 @@ st.set_page_config(
 )
 
 # ========== STATIC CONFIGURATION ==========
-API_BASE_URL = "http://127.0.0.1:8001"
+API_BASE_URL = "https://ai-agent-k4v6.onrender.com"
 API_QUERY_ENDPOINT = f"{API_BASE_URL}/api/v1/query"
 TECHCORP_ORG_ID = "11111111-1111-1111-1111-111111111111"
 
