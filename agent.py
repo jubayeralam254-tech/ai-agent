@@ -1,3 +1,4 @@
+
 import os
 import operator
 import asyncio
@@ -43,25 +44,65 @@ llm = ChatGoogleGenerativeAI(
 structured_llm = llm.with_structured_output(ResolutionDecision)
 
 
+# ─── RETRY HELPERS ────────────────────────────────────────────────────────────
+
+async def embed_with_retry(query_text: str, max_retries: int = 3) -> dict:
+    """
+    Calls Gemini embed_content with exponential backoff on 429 rate-limit errors.
+    Waits 2^attempt seconds between retries (1s → 2s → 4s).
+    """
+    loop = asyncio.get_running_loop()
+    for attempt in range(max_retries):
+        try:
+            embed_result = await loop.run_in_executor(
+                None,
+                lambda: genai.embed_content(
+                    model="models/gemini-embedding-001",
+                    content=query_text
+                )
+            )
+            return embed_result
+        except Exception as e:
+            is_rate_limit = "429" in str(e) or "quota" in str(e).lower()
+            if is_rate_limit and attempt < max_retries - 1:
+                wait_seconds = 2 ** attempt   # 1s, 2s, 4s
+                print(f"DEBUG: 429 on embedding (attempt {attempt + 1}), retrying in {wait_seconds}s...")
+                await asyncio.sleep(wait_seconds)
+            else:
+                raise
+
+
+async def llm_invoke_with_retry(messages: list, max_retries: int = 3) -> ResolutionDecision:
+    """
+    Calls structured_llm.ainvoke with exponential backoff on 429 rate-limit errors.
+    """
+    for attempt in range(max_retries):
+        try:
+            return await structured_llm.ainvoke(messages)
+        except Exception as e:
+            is_rate_limit = "429" in str(e) or "quota" in str(e).lower()
+            if is_rate_limit and attempt < max_retries - 1:
+                wait_seconds = 2 ** attempt
+                print(f"DEBUG: 429 on LLM call (attempt {attempt + 1}), retrying in {wait_seconds}s...")
+                await asyncio.sleep(wait_seconds)
+            else:
+                raise
+
+
+# ─── NODES ────────────────────────────────────────────────────────────────────
+
 async def retrieve_context_node(state: AgentState) -> dict:
     query_text = state["query"]
     org_id = state["organization_id"]
 
     try:
-        embed_result = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: genai.embed_content(
-                model="models/gemini-embedding-001",
-                content=query_text
-            )
-        )
+        embed_result = await embed_with_retry(query_text)
         query_embedding = embed_result['embedding']
         print(f"DEBUG: embedding len={len(query_embedding)}")
     except Exception as e:
         print(f"DEBUG: embedding error={str(e)}")
         return {"retrieved_context": f"Error: {str(e)}", "steps_taken": ["Embedder Failure"]}
 
-    # Use raw SQL to avoid ORM pgvector type issues
     embedding_str = "[" + ",".join(map(str, query_embedding)) + "]"
 
     retrieved_docs = []
@@ -105,7 +146,16 @@ async def ai_responder_node(state: AgentState) -> dict:
         HumanMessage(content=human_prompt)
     ]
 
-    decision: ResolutionDecision = await structured_llm.ainvoke(messages)
+    try:
+        decision: ResolutionDecision = await llm_invoke_with_retry(messages)
+    except Exception as e:
+        print(f"DEBUG: LLM error after retries={str(e)}")
+        return {
+            "final_response": "Service temporarily unavailable. Please try again in a moment.",
+            "needs_human": True,
+            "steps_taken": ["LLM Failure — routed to human agent"]
+        }
+
     needs_human = not decision.can_resolve
 
     return {
@@ -114,6 +164,8 @@ async def ai_responder_node(state: AgentState) -> dict:
         "steps_taken": [f"AI Decision: Resolve={decision.can_resolve}, Confidence={decision.confidence_score}"]
     }
 
+
+# ─── GRAPH ────────────────────────────────────────────────────────────────────
 
 def build_graph() -> StateGraph:
     workflow = StateGraph(AgentState)
