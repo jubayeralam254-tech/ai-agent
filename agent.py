@@ -111,7 +111,7 @@ async def retrieve_context_node(state: AgentState) -> dict:
     org_id = state["organization_id"]
 
     try:
-        embed_result = await embed_with_retry(query_text)
+        embed_result = await embed_with_cache_and_retry(query_text)
         query_embedding = embed_result['embedding']
         print(f"DEBUG: embedding len={len(query_embedding)}")
     except Exception as e:
