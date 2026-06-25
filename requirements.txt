@@ -13,3 +13,4 @@ requests
 python-dotenv
 pydantic[email]
 google-generativeai
+slowapi
