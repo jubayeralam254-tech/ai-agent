@@ -1,35 +1,25 @@
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, status, Request
 from fastapi.middleware.cors import CORSMiddleware
-
-# Local imports
-from schemas import QueryRequest, QueryResponse
-from database import init_db
-from agent import run_support_agent
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
-limiter = Limiter(key_func=get_remote_address)
-app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+from schemas import QueryRequest, QueryResponse
+from database import init_db
+from agent import run_support_agent
 
-@app.post("/api/v1/query", response_model=QueryResponse)
-@limiter.limit("5/minute")  # per IP, per minute
-async def ask_agent(request: Request, body: QueryRequest):
-    ...
+# 1. Limiter আগে বানাও
+limiter = Limiter(key_func=get_remote_address)
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    FastAPI lifespan manager. 
-    Startup: Initialize database connection and schemas/pgvector.
-    Shutdown: Clean up resources.
-    """
     print("Initializing Database Connections and PGVector...")
     await init_db()
     yield
     print("Shutting down AI Support Operations Platform...")
 
+# 2. App বানাও
 app = FastAPI(
     title="AI Support Operations Platform",
     description="Enterprise-grade AI support routing and resolution API.",
@@ -37,10 +27,13 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# Configure CORS for frontend connectivity
+# 3. App বানানোর পরে state আর exception handler লাগাও
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Update this to specific origins in production!
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -48,33 +41,16 @@ app.add_middleware(
 
 @app.get("/health")
 async def health_check():
-    """Simple health check endpoint for Render/Kubernetes."""
     return {"status": "healthy", "service": "AI Support API"}
 
+# 4. Route একবারই define করো, Request parameter আগে রাখো
 @app.post("/api/v1/query", response_model=QueryResponse)
-async def ask_agent(
-    request: QueryRequest
-):
-    """
-    Main entry point for customer queries.
-    Expects a query and an organization_id for tenant-isolated RAG.
-    """
+@limiter.limit("5/minute")
+async def ask_agent(request: Request, body: QueryRequest):
     try:
-        # We pass the query and Org ID down into our LangGraph async entry point
         agent_result = await run_support_agent(
-            query=request.query, 
-            organization_id=request.organization_id
+            query=body.query,
+            organization_id=body.organization_id
         )
-        
         return QueryResponse(
             result=agent_result["response"],
-                needs_human=agent_result["needs_human"],  # এটা add করো
-
-            agent_steps=agent_result["steps"]
-        )
-    except Exception as e:
-        # In a real SaaS, we would log this structured exception to Sentry/Datadog
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Agent workflow failed: {str(e)}"
-        )
