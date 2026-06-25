@@ -6,7 +6,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from schemas import QueryRequest, QueryResponse
 from database import init_db
 from agent import run_support_agent
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+@app.post("/api/v1/query", response_model=QueryResponse)
+@limiter.limit("5/minute")  # per IP, per minute
+async def ask_agent(request: Request, body: QueryRequest):
+    ...
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
