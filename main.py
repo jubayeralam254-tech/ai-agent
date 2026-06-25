@@ -9,7 +9,6 @@ from schemas import QueryRequest, QueryResponse
 from database import init_db
 from agent import run_support_agent
 
-# 1. Limiter আগে বানাও
 limiter = Limiter(key_func=get_remote_address)
 
 @asynccontextmanager
@@ -19,7 +18,6 @@ async def lifespan(app: FastAPI):
     yield
     print("Shutting down AI Support Operations Platform...")
 
-# 2. App বানাও
 app = FastAPI(
     title="AI Support Operations Platform",
     description="Enterprise-grade AI support routing and resolution API.",
@@ -27,7 +25,6 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# 3. App বানানোর পরে state আর exception handler লাগাও
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -43,7 +40,6 @@ app.add_middleware(
 async def health_check():
     return {"status": "healthy", "service": "AI Support API"}
 
-# 4. Route একবারই define করো, Request parameter আগে রাখো
 @app.post("/api/v1/query", response_model=QueryResponse)
 @limiter.limit("5/minute")
 async def ask_agent(request: Request, body: QueryRequest):
@@ -54,3 +50,11 @@ async def ask_agent(request: Request, body: QueryRequest):
         )
         return QueryResponse(
             result=agent_result["response"],
+            needs_human=agent_result["needs_human"],
+            agent_steps=agent_result["steps"]
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Agent workflow failed: {str(e)}"
+        )
