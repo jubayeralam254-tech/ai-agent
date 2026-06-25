@@ -5,7 +5,22 @@ import asyncio
 from dotenv import load_dotenv
 from typing import Annotated, TypedDict, List
 from uuid import UUID
+from functools import lru_cache
+import hashlib
 
+# Simple in-memory cache (production-এ Redis ব্যবহার করো)
+_embedding_cache: dict = {}
+
+async def embed_with_cache_and_retry(query_text: str) -> dict:
+    cache_key = hashlib.md5(query_text.encode()).hexdigest()
+    
+    if cache_key in _embedding_cache:
+        print(f"DEBUG: Cache hit for query")
+        return _embedding_cache[cache_key]
+    
+    result = await embed_with_retry(query_text)
+    _embedding_cache[cache_key] = result
+    return result
 load_dotenv()
 
 import google.generativeai as genai
