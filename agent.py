@@ -1,26 +1,11 @@
-
 import os
 import operator
 import asyncio
+import random
 from dotenv import load_dotenv
 from typing import Annotated, TypedDict, List
 from uuid import UUID
-from functools import lru_cache
-import hashlib
 
-# Simple in-memory cache (production-এ Redis ব্যবহার করো)
-_embedding_cache: dict = {}
-
-async def embed_with_cache_and_retry(query_text: str) -> dict:
-    cache_key = hashlib.md5(query_text.encode()).hexdigest()
-    
-    if cache_key in _embedding_cache:
-        print(f"DEBUG: Cache hit for query")
-        return _embedding_cache[cache_key]
-    
-    result = await embed_with_retry(query_text)
-    _embedding_cache[cache_key] = result
-    return result
 load_dotenv()
 
 import google.generativeai as genai
@@ -61,10 +46,13 @@ structured_llm = llm.with_structured_output(ResolutionDecision)
 
 # ─── RETRY HELPERS ────────────────────────────────────────────────────────────
 
-async def embed_with_retry(query_text: str, max_retries: int = 3) -> dict:
+# Wait times: 5s, 15s, 45s — long enough for Gemini free-tier quota to reset
+RETRY_WAIT_SECONDS = [5, 15, 45]
+
+async def embed_with_retry(query_text: str, max_retries: int = 4) -> dict:
     """
     Calls Gemini embed_content with exponential backoff on 429 rate-limit errors.
-    Waits 2^attempt seconds between retries (1s → 2s → 4s).
+    Wait times: 5s → 15s → 45s (+ random jitter to avoid thundering herd).
     """
     loop = asyncio.get_running_loop()
     for attempt in range(max_retries):
@@ -80,16 +68,17 @@ async def embed_with_retry(query_text: str, max_retries: int = 3) -> dict:
         except Exception as e:
             is_rate_limit = "429" in str(e) or "quota" in str(e).lower()
             if is_rate_limit and attempt < max_retries - 1:
-                wait_seconds = 2 ** attempt   # 1s, 2s, 4s
-                print(f"DEBUG: 429 on embedding (attempt {attempt + 1}), retrying in {wait_seconds}s...")
+                wait_seconds = RETRY_WAIT_SECONDS[attempt] + random.uniform(0, 2)
+                print(f"DEBUG: 429 on embedding (attempt {attempt + 1}), retrying in {wait_seconds:.1f}s...")
                 await asyncio.sleep(wait_seconds)
             else:
                 raise
 
 
-async def llm_invoke_with_retry(messages: list, max_retries: int = 3) -> ResolutionDecision:
+async def llm_invoke_with_retry(messages: list, max_retries: int = 4) -> ResolutionDecision:
     """
     Calls structured_llm.ainvoke with exponential backoff on 429 rate-limit errors.
+    Wait times: 5s → 15s → 45s (+ random jitter).
     """
     for attempt in range(max_retries):
         try:
@@ -97,8 +86,8 @@ async def llm_invoke_with_retry(messages: list, max_retries: int = 3) -> Resolut
         except Exception as e:
             is_rate_limit = "429" in str(e) or "quota" in str(e).lower()
             if is_rate_limit and attempt < max_retries - 1:
-                wait_seconds = 2 ** attempt
-                print(f"DEBUG: 429 on LLM call (attempt {attempt + 1}), retrying in {wait_seconds}s...")
+                wait_seconds = RETRY_WAIT_SECONDS[attempt] + random.uniform(0, 2)
+                print(f"DEBUG: 429 on LLM call (attempt {attempt + 1}), retrying in {wait_seconds:.1f}s...")
                 await asyncio.sleep(wait_seconds)
             else:
                 raise
@@ -111,7 +100,7 @@ async def retrieve_context_node(state: AgentState) -> dict:
     org_id = state["organization_id"]
 
     try:
-        embed_result = await embed_with_cache_and_retry(query_text)
+        embed_result = await embed_with_retry(query_text)
         query_embedding = embed_result['embedding']
         print(f"DEBUG: embedding len={len(query_embedding)}")
     except Exception as e:
