@@ -59,16 +59,18 @@ class UserResponse(UserBase, ORMBase):
 
 
 # --- DOCUMENT ---
-class DocumentBase(BaseModel):
-    organization_id: UUID
+class DocumentUploadRequest(BaseModel):
     title: str = Field(..., max_length=255)
+    content: str = Field(..., min_length=10, description="Text content to embed")
     source_url: Optional[str] = None
 
-class DocumentCreate(DocumentBase):
-    content: str
-
-class DocumentResponse(DocumentBase, ORMBase):
-    pass
+class DocumentResponse(BaseModel):
+    id: UUID
+    organization_id: UUID
+    title: str
+    source_url: Optional[str]
+    created_at: datetime
+    model_config = ConfigDict(from_attributes=True)
 
 
 # --- TICKET ---
