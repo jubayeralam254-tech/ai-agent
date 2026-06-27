@@ -170,7 +170,7 @@ async def upload_document(
             INSERT INTO document_chunks
                 (id, document_id, content, chunk_index, embedding, created_at, updated_at)
             VALUES
-                (gen_random_uuid(), :doc_id, :content, 0, :embedding::vector, NOW(), NOW())
+                (gen_random_uuid(), :doc_id, :content, 0, CAST(:embedding AS vector), NOW(), NOW())
         """),
         {
             "doc_id": str(doc.id),
