@@ -1,18 +1,49 @@
 # AI Support Operations Platform
 
-An enterprise-grade AI support ticketing system that automatically resolves customer queries using Retrieval-Augmented Generation (RAG), with intelligent escalation to human agents when needed. Built with a multi-tenant architecture to support multiple organizations from a single deployment.
+> **Enterprise-grade multi-tenant AI support system** — auto-resolves customer tickets using RAG, escalates complex cases to human agents, and streams responses in real time.
 
-**Live API:** [Deployed on Render](#deployment)  
+**Live API:** https://ai-agent-k4v6.onrender.com  
+**Interactive Docs:** https://ai-agent-k4v6.onrender.com/docs  
 **Frontend:** Streamlit (run locally, connects to deployed API)
 
 ---
 
-## What It Does
+## What This Solves
 
-A customer submits a support ticket. The system embeds the query, searches a vector database for relevant knowledge base documents scoped to that customer's organization, and passes the retrieved context to an LLM. The LLM decides whether it can confidently resolve the ticket or whether it needs to escalate to a human agent — returning a structured decision with a confidence score.
+Most support systems are either fully manual (slow, expensive) or fully automated (frustrating when the bot can't help). This platform does both intelligently:
 
-**Auto-resolved:** The customer gets an instant answer.  
-**Escalated:** The ticket is flagged with a summary for the human agent.
+- **Auto-resolves** tickets the AI can handle confidently — instant response, no human needed
+- **Escalates** tickets outside the knowledge base — flags them with a summary for human review
+- **Multi-tenant** — one deployment serves multiple organizations, each with isolated knowledge bases and users
+
+---
+
+## Live Demo
+
+```bash
+# 1. Register
+curl -X POST https://ai-agent-k4v6.onrender.com/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"email": "demo@yourcompany.com", "password": "yourpassword", 
+       "organization_id": "11111111-1111-1111-1111-111111111111", "role": "customer"}'
+
+# 2. Login → get JWT token
+curl -X POST https://ai-agent-k4v6.onrender.com/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email": "demo@yourcompany.com", "password": "yourpassword"}'
+
+# 3. Query (standard)
+curl -X POST https://ai-agent-k4v6.onrender.com/api/v1/query \
+  -H "Authorization: Bearer " \
+  -H "Content-Type: application/json" \
+  -d '{"query": "What is your refund policy?"}'
+
+# 4. Query (streaming — SSE)
+curl -X POST https://ai-agent-k4v6.onrender.com/api/v1/query/stream \
+  -H "Authorization: Bearer " \
+  -H "Content-Type: application/json" \
+  -d '{"query": "How do I reset my password?"}' --no-buffer
+```
 
 ---
 
@@ -25,36 +56,48 @@ A customer submits a support ticket. The system embeds the query, searches a vec
 | LLM | Google Gemini 2.5 Flash Lite |
 | Embeddings | Gemini Embedding 001 (3072-dim) |
 | Vector Search | pgvector (`<->` cosine distance) |
-| Database | PostgreSQL (Neon cloud / local) |
+| Database | PostgreSQL (Neon cloud) |
 | Async ORM | SQLAlchemy (asyncpg driver) |
+| Authentication | JWT (python-jose + bcrypt) |
+| Rate Limiting | SlowAPI (per-IP) |
+| Streaming | Server-Sent Events (SSE) |
 | Frontend | Streamlit |
-| Structured Output | Pydantic + LangChain structured LLM |
+| Containerization | Docker + docker-compose |
 
 ---
 
 ## Architecture
-
-```
 Customer Query
-      │
-      ▼
-FastAPI  POST /api/v1/query
-      │
-      ▼
+
+│
+
+▼
+
+FastAPI  ──  JWT Auth Middleware
+
+│
+
+▼
+
 LangGraph Agent
-  ┌───────────────────────────────┐
-  │  Node 1: retrieve_context     │  ← Embeds query → pgvector similarity search
-  │  Node 2: ai_responder         │  ← LLM + structured output (ResolutionDecision)
-  └───────────────────────────────┘
-      │
-      ▼
-  can_resolve = True  →  Return answer to customer
-  can_resolve = False →  Flag for human agent + summary
-```
 
-**Multi-tenancy:** Every query is scoped by `organization_id`. The vector search uses a `WHERE d.organization_id = :org_id` clause — one organization can never retrieve another's knowledge base documents.
+┌─────────────────────────────────────┐
 
-**Structured LLM Output:** The LLM doesn't return free text. It returns a Pydantic-validated `ResolutionDecision` object:
+│  Node 1: retrieve_context           │  ← Embeds query → pgvector similarity search
+
+│  Node 2: ai_responder               │  ← Gemini LLM + structured Pydantic output
+
+└─────────────────────────────────────┘
+
+│
+
+├── can_resolve = True  →  Stream answer to customer + log ticket
+
+└── can_resolve = False →  Flag for human agent + log escalated ticket
+
+**Multi-tenancy:** Every query is scoped by `organization_id` extracted from the JWT token. The vector search enforces `WHERE d.organization_id = :org_id` — one organization can never access another's knowledge base.
+
+**Structured LLM Output:** The LLM returns a Pydantic-validated object, not free text:
 ```python
 class ResolutionDecision(BaseModel):
     can_resolve: bool
@@ -64,208 +107,230 @@ class ResolutionDecision(BaseModel):
 
 ---
 
-## Project Structure
+## API Reference
 
+### Authentication
+
+| Method | Endpoint | Auth | Description |
+|---|---|---|---|
+| POST | `/auth/register` | Public | Register new user |
+| POST | `/auth/login` | Public | Login → JWT token |
+
+### Core
+
+| Method | Endpoint | Auth | Description |
+|---|---|---|---|
+| POST | `/api/v1/query` | JWT | Submit support ticket |
+| POST | `/api/v1/query/stream` | JWT | Submit ticket (SSE streaming) |
+| GET | `/api/v1/tickets` | JWT | List org's tickets |
+| GET | `/api/v1/documents` | JWT | List knowledge base docs |
+| POST | `/api/v1/documents` | Admin/Agent | Upload new KB document |
+
+### Admin
+
+| Method | Endpoint | Auth | Description |
+|---|---|---|---|
+| POST | `/api/v1/admin/organizations` | Admin | Create new tenant |
+| GET | `/api/v1/admin/organizations` | Admin | List all tenants |
+| GET | `/api/v1/admin/tickets/escalated` | Admin | View escalated tickets |
+
+### System
+
+| Method | Endpoint | Auth | Description |
+|---|---|---|---|
+| GET | `/health` | Public | DB + service health check |
+
+---
+
+### Example Responses
+
+**Auto-resolved ticket:**
+```json
+{
+  "result": "To reset your password, visit /reset-password on the login page...",
+  "needs_human": false,
+  "agent_steps": [
+    "Started Support Workflow",
+    "Retrieved context from Vector DB",
+    "AI Decision: Resolve=True, Confidence=1.0"
+  ],
+  "ticket_id": "506b1da5-4fbc-41d8-8ed8-3421af938272"
+}
 ```
-├── main.py          # FastAPI app, lifespan, CORS, routes
-├── agent.py         # LangGraph workflow (retrieve → respond → END)
-├── database.py      # Async SQLAlchemy engine + session factory
-├── models.py        # SQLAlchemy ORM models (Organization, Document, DocumentChunk)
-├── schemas.py       # Pydantic request/response schemas
-├── seed_fixed.py    # Seeds DB with sample org + knowledge base (3072-dim embeddings)
-├── reset_db.py      # Creates tables without dropping data
-├── app.py           # Streamlit customer frontend
-├── render.yaml      # Render deployment config
+
+**Escalated ticket:**
+```json
+{
+  "result": "Customer is asking about enterprise billing. Requires account manager review.",
+  "needs_human": true,
+  "agent_steps": ["..."],
+  "ticket_id": "758e4618-f63f-43c4-ab98-e68a41921801"
+}
+```
+
+**Streaming response (SSE):**
+data: {"type": "step", "content": "Started Support Workflow"}
+
+data: {"type": "step", "content": "Retrieving knowledge base context..."}
+
+data: {"type": "step", "content": "Streaming response..."}
+
+data: {"type": "token", "content": "Our "}
+
+data: {"type": "token", "content": "refund "}
+
+data: {"type": "token", "content": "policy "}
+
+...
+
+data: {"type": "done", "needs_human": false, "ticket_id": "3c73f6f6-..."}
+
+---
+
+## Project Structure
+├── main.py           # FastAPI app — all routes, middleware, rate limiting
+
+├── agent.py          # LangGraph workflow (retrieve → respond → END)
+
+├── auth.py           # JWT token creation, password hashing, auth dependency
+
+├── database.py       # Async SQLAlchemy engine + session factory
+
+├── models.py         # ORM models: Organization, User, Document, DocumentChunk, Ticket
+
+├── schemas.py        # Pydantic request/response schemas
+
+├── app.py            # Streamlit frontend (login, register, query UI)
+
+├── seed_fixed.py     # Seeds DB with sample org + 3 knowledge base documents
+
+├── reset_db.py       # Safe schema migration (adds tables/columns, no data loss)
+
+├── Dockerfile        # Production container
+
+├── docker-compose.yml # Local dev: API + PostgreSQL with pgvector
+
+├── render.yaml       # Render deployment config
+
 └── requirements.txt
-```
 
 ---
 
 ## Local Setup
 
-### Prerequisites
-- Python 3.10+
-- PostgreSQL running locally
-- Gemini API key (free at [aistudio.google.com](https://aistudio.google.com))
-
-### 1. Clone and install
+### Option A: Docker (Recommended)
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/YOUR_REPO.git
-cd YOUR_REPO
+git clone https://github.com/jubayeralam254-tech/ai-agent.git
+cd ai-agent
+
+# Create .env
+cp .env.example .env
+# Add your GEMINI_API_KEY to .env
+
+# Start everything
+docker compose up --build
+```
+
+API runs at `http://localhost:8001`  
+Docs at `http://localhost:8001/docs`
+
+### Option B: Manual
+
+**Prerequisites:** Python 3.10+, PostgreSQL with pgvector, Gemini API key
+
+```bash
+git clone https://github.com/jubayeralam254-tech/ai-agent.git
+cd ai-agent
 pip install -r requirements.txt
 ```
 
-### 2. Create `.env` file
-
+Create `.env`:
 ```env
-GEMINI_API_KEY=your_gemini_api_key_here
-DATABASE_URL=postgresql+asyncpg://postgres:YOUR_PASSWORD@localhost:5432/ai_support_db
+GEMINI_API_KEY=your_key_here
+DATABASE_URL=postgresql+asyncpg://postgres:password@localhost:5432/ai_support_db
+JWT_SECRET_KEY=your-secret-key-here
 ```
 
-> ⚠️ Never commit `.env` to Git. Confirm `.gitignore` includes `.env`.
-
-### 3. Create the local database
-
 ```bash
+# Create DB
 psql -U postgres -c "CREATE DATABASE ai_support_db;"
-```
 
-### 4. Start the FastAPI backend
-
-```bash
+# Start API (auto-creates tables on startup)
 uvicorn main:app --port 8001 --reload
-```
 
-On startup, the app automatically:
-- Enables the `pgvector` extension
-- Creates all tables via SQLAlchemy
-
-### 5. Seed the knowledge base
-
-```bash
+# Seed knowledge base
 python seed_fixed.py
-```
 
-This inserts a sample organization (`TechCorp SaaS`) and 3 knowledge base documents with 3072-dim Gemini embeddings:
-- Password Policy
-- Refund Policy
-- API Rate Limits
-
-### 6. Run the Streamlit frontend
-
-```bash
+# Run frontend
 streamlit run app.py
 ```
 
-Open `http://localhost:8501`. The frontend connects to the FastAPI backend at `http://127.0.0.1:8001`.
-
 ---
 
-## API Reference
+## Deployment
 
-### Health Check
-```
-GET /health
-```
-```json
-{"status": "healthy", "service": "AI Support API"}
-```
+Deployed on **Render** via `render.yaml`. Auto-deploys on every push to `main`.
 
-### Submit Support Query
-```
-POST /api/v1/query
-```
+### Environment Variables (Render Dashboard)
 
-**Request:**
-```json
-{
-  "query": "How do I reset my password?",
-  "organization_id": "11111111-1111-1111-1111-111111111111",
-  "user_id": "00000000-0000-0000-0000-000000000000"
-}
-```
-
-**Response:**
-```json
-{
-  "result": "To reset your password, visit the /reset-password link on the login page...",
-  "needs_human": false,
-  "agent_steps": [
-    "Started Support Workflow",
-    "Retrieved context from Vector DB",
-    "AI Decision: Resolve=True, Confidence=0.95"
-  ]
-}
-```
-
-**`needs_human: true` example** (query outside knowledge base):
-```json
-{
-  "result": "Customer is asking about enterprise billing arrangements. Requires account manager review.",
-  "needs_human": true,
-  "agent_steps": [...]
-}
-```
-
----
-
-## Deployment (Render)
-
-The FastAPI backend is configured for Render via `render.yaml`.
-
-### Steps
-
-1. Push code to GitHub
-2. Create a new **Web Service** on Render, connect your repo
-3. Render auto-detects `render.yaml`
-4. Go to **Environment** → add these variables manually:
-
-| Key | Value |
+| Key | Description |
 |---|---|
-| `GEMINI_API_KEY` | Your Gemini API key |
-| `DATABASE_URL` | `postgresql+asyncpg://USER:PASS@HOST/DBNAME?ssl=require` |
-
-5. Deploy. Render runs:
-   ```
-   pip install -r requirements.txt
-   uvicorn main:app --host 0.0.0.0 --port $PORT
-   ```
-
-6. After first deploy, run `seed_fixed.py` once with the production `DATABASE_URL` set in your local `.env` to populate the cloud database.
-
-> **Note:** The Streamlit frontend is not deployed — it runs locally and points to the live API. Update `API_BASE_URL` in `app.py` to your Render service URL before running against production.
+| `GEMINI_API_KEY` | Google AI Studio API key |
+| `DATABASE_URL` | `postgresql+asyncpg://USER:PASS@HOST/DB?ssl=require` |
+| `JWT_SECRET_KEY` | Strong random string for JWT signing |
 
 ---
 
 ## Database Schema
-
-```
 organizations
-  └── id (UUID PK)
-  └── name
 
+└── id (UUID PK), name
+users  (FK → organizations)
+
+└── id, organization_id, email, role, hashed_password
 documents  (FK → organizations)
-  └── id, organization_id, title, source_url
 
+└── id, organization_id, title, source_url
 document_chunks  (FK → documents)
-  └── id, document_id, content, chunk_index
-  └── embedding  Vector(3072)   ← pgvector column
-```
 
-Similarity search query:
-```sql
-SELECT dc.content
-FROM document_chunks dc
-JOIN documents d ON dc.document_id = d.id
-WHERE d.organization_id = :org_id
-ORDER BY dc.embedding <-> CAST(:embedding AS vector)
-LIMIT 3;
-```
+└── id, document_id, content, chunk_index
+
+└── embedding  Vector(3072)  ← pgvector
+tickets  (FK → organizations, users)
+
+└── id, organization_id, user_id
+
+└── query, response, needs_human, created_at
 
 ---
 
 ## Key Technical Decisions
 
-**Why raw SQL for vector search instead of ORM?**  
-asyncpg requires explicit pgvector type registration when using SQLAlchemy ORM. Raw SQL with `CAST(:embedding AS vector)` bypasses this entirely and is simpler and more reliable.
+**Why raw SQL for vector search?**  
+asyncpg requires explicit pgvector type registration with SQLAlchemy ORM. `CAST(:embedding AS vector)` in raw SQL bypasses this cleanly and reliably.
 
 **Why `run_in_executor` for embeddings?**  
-`genai.embed_content()` is a synchronous call. Wrapping it in `run_in_executor` prevents it from blocking the async event loop.
+`genai.embed_content()` is synchronous. Wrapping it prevents blocking the async event loop under concurrent requests.
 
-**Why `gemini-embedding-001` and not `text-embedding-004`?**  
-`gemini-embedding-001` produces 3072-dimensional vectors. The schema uses `Vector(3072)`. Using `text-embedding-004` (768-dim) would cause a dimension mismatch at insert time.
+**Why SSE over WebSockets for streaming?**  
+SSE is unidirectional and HTTP-native — simpler to implement, works through proxies, and sufficient for one-way token streaming. WebSockets would add complexity without benefit here.
+
+**Why LangGraph over vanilla LLM calls?**  
+The graph structure makes the retrieve → respond pipeline explicit, testable, and extensible. Adding new nodes (e.g. conversation history, tool calling) requires minimal changes to the existing graph.
 
 ---
 
-## Portfolio Notes
+## Roadmap
 
-This project demonstrates:
-- Multi-tenant RAG pipeline with vector similarity search
-- Structured LLM outputs via Pydantic (no free-text parsing)
-- LangGraph for agent workflow orchestration
-- Async FastAPI with SQLAlchemy asyncpg
-- Production-ready separation of concerns across 7 files
+- [ ] Conversation history (multi-turn context)
+- [ ] Tool-calling agents (calendar, CRM integrations)
+- [ ] Webhook notifications for escalated tickets
+- [ ] Analytics dashboard (resolution rate, avg confidence)
+
+---
 
 **Built by:** Jubayer Alam  
-**Stack:** FastAPI · LangGraph · pgvector · Gemini API · Streamlit
+**Stack:** FastAPI · LangGraph · pgvector · Gemini API · JWT · SSE · Docker · Streamlit
+
+
