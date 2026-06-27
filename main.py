@@ -1,10 +1,12 @@
 import asyncio
+import json
 import os
 from contextlib import asynccontextmanager
 
 import google.generativeai as genai
 from fastapi import FastAPI, HTTPException, status, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
@@ -19,12 +21,10 @@ from schemas import (
     DocumentUploadRequest, DocumentResponse,
     OrganizationCreate, OrganizationResponse,
 )
-from database import init_db, get_db
+from database import init_db, get_db, AsyncSessionLocal
 from agent import run_support_agent
 from models import User, Organization, Ticket, Document, DocumentChunk
 from auth import hash_password, verify_password, create_access_token, get_current_user
-
-# ─── RATE LIMITER ─────────────────────────────────────────────────────────────
 
 limiter = Limiter(key_func=get_remote_address)
 
@@ -40,7 +40,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="AI Support Operations Platform",
-    description="Enterprise-grade multi-tenant AI support API with JWT auth.",
+    description="Enterprise-grade multi-tenant AI support API with JWT auth and streaming.",
     version="2.0.0",
     lifespan=lifespan,
 )
@@ -197,7 +197,7 @@ async def list_documents(
     return result.scalars().all()
 
 
-# ─── QUERY ────────────────────────────────────────────────────────────────────
+# ─── QUERY (Standard) ─────────────────────────────────────────────────────────
 
 @app.post("/api/v1/query", response_model=QueryResponse)
 @limiter.limit("30/minute")
@@ -234,6 +234,79 @@ async def ask_agent(
         raise HTTPException(status_code=500, detail=f"Agent workflow failed: {str(e)}")
 
 
+# ─── QUERY (Streaming) ────────────────────────────────────────────────────────
+
+@app.post("/api/v1/query/stream")
+@limiter.limit("30/minute")
+async def ask_agent_stream(
+    request: Request,
+    body: QueryRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Streaming version of the query endpoint.
+    Returns Server-Sent Events (SSE):
+      - type: step   → agent progress updates
+      - type: token  → response words one by one
+      - type: done   → final metadata (needs_human, ticket_id)
+      - type: error  → error message
+    """
+    user_id = current_user.id
+    org_id = current_user.organization_id
+    query = body.query
+
+    async def event_generator():
+        yield f"data: {json.dumps({'type': 'step', 'content': 'Started Support Workflow'})}\n\n"
+        await asyncio.sleep(0)
+
+        yield f"data: {json.dumps({'type': 'step', 'content': 'Retrieving knowledge base context...'})}\n\n"
+        await asyncio.sleep(0)
+
+        try:
+            agent_result = await run_support_agent(
+                query=query,
+                organization_id=org_id,
+            )
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'content': str(e)})}\n\n"
+            return
+
+        yield f"data: {json.dumps({'type': 'step', 'content': 'Streaming response...'})}\n\n"
+        await asyncio.sleep(0)
+
+        # Stream response word by word
+        words = agent_result["response"].split()
+        for i, word in enumerate(words):
+            chunk = word + (" " if i < len(words) - 1 else "")
+            yield f"data: {json.dumps({'type': 'token', 'content': chunk})}\n\n"
+            await asyncio.sleep(0.04)
+
+        # Save ticket
+        async with AsyncSessionLocal() as session:
+            ticket = Ticket(
+                organization_id=org_id,
+                user_id=user_id,
+                query=query,
+                response=agent_result["response"],
+                needs_human=agent_result["needs_human"],
+            )
+            session.add(ticket)
+            await session.commit()
+            await session.refresh(ticket)
+            ticket_id = str(ticket.id)
+
+        yield f"data: {json.dumps({'type': 'done', 'needs_human': agent_result['needs_human'], 'ticket_id': ticket_id})}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        }
+    )
+
+
 # ─── TICKETS ──────────────────────────────────────────────────────────────────
 
 @app.get("/api/v1/tickets", response_model=list[TicketResponse])
@@ -250,7 +323,7 @@ async def get_tickets(
     return result.scalars().all()
 
 
-# ─── ADMIN ENDPOINTS ──────────────────────────────────────────────────────────
+# ─── ADMIN ────────────────────────────────────────────────────────────────────
 
 @app.post("/api/v1/admin/organizations", response_model=OrganizationResponse, status_code=201)
 async def create_organization(
@@ -258,7 +331,6 @@ async def create_organization(
     current_user: User = Depends(require_role("admin")),
     db: AsyncSession = Depends(get_db),
 ):
-    """Create a new tenant organization. Admin only."""
     org = Organization(name=body.name)
     db.add(org)
     await db.commit()
@@ -271,7 +343,6 @@ async def list_organizations(
     current_user: User = Depends(require_role("admin")),
     db: AsyncSession = Depends(get_db),
 ):
-    """List all tenant organizations. Admin only."""
     result = await db.execute(
         select(Organization).order_by(Organization.created_at.desc())
     )
@@ -283,7 +354,6 @@ async def get_escalated_tickets(
     current_user: User = Depends(require_role("admin")),
     db: AsyncSession = Depends(get_db),
 ):
-    """List all tickets that need human review. Admin only."""
     result = await db.execute(
         select(Ticket)
         .where(Ticket.needs_human == True)
