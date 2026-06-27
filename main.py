@@ -3,8 +3,11 @@ import os
 from contextlib import asynccontextmanager
 
 import google.generativeai as genai
-from fastapi import FastAPI, HTTPException, status, Depends
+from fastapi import FastAPI, HTTPException, status, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -14,11 +17,16 @@ from schemas import (
     LoginRequest, Token,
     TicketResponse,
     DocumentUploadRequest, DocumentResponse,
+    OrganizationCreate, OrganizationResponse,
 )
 from database import init_db, get_db
 from agent import run_support_agent
 from models import User, Organization, Ticket, Document, DocumentChunk
 from auth import hash_password, verify_password, create_access_token, get_current_user
+
+# ─── RATE LIMITER ─────────────────────────────────────────────────────────────
+
+limiter = Limiter(key_func=get_remote_address)
 
 
 @asynccontextmanager
@@ -36,6 +44,9 @@ app = FastAPI(
     version="2.0.0",
     lifespan=lifespan,
 )
+
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.add_middleware(
     CORSMiddleware,
@@ -79,7 +90,8 @@ async def health_check(db: AsyncSession = Depends(get_db)):
 # ─── AUTH ─────────────────────────────────────────────────────────────────────
 
 @app.post("/auth/register", response_model=UserResponse, status_code=201)
-async def register(user_data: UserRegister, db: AsyncSession = Depends(get_db)):
+@limiter.limit("5/minute")
+async def register(request: Request, user_data: UserRegister, db: AsyncSession = Depends(get_db)):
     existing = await db.execute(select(User).where(User.email == user_data.email))
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=400, detail="Email already registered")
@@ -101,7 +113,8 @@ async def register(user_data: UserRegister, db: AsyncSession = Depends(get_db)):
 
 
 @app.post("/auth/login", response_model=Token)
-async def login(login_data: LoginRequest, db: AsyncSession = Depends(get_db)):
+@limiter.limit("10/minute")
+async def login(request: Request, login_data: LoginRequest, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(User).where(User.email == login_data.email))
     user = result.scalar_one_or_none()
 
@@ -127,43 +140,34 @@ async def login(login_data: LoginRequest, db: AsyncSession = Depends(get_db)):
 # ─── DOCUMENTS ────────────────────────────────────────────────────────────────
 
 @app.post("/api/v1/documents", response_model=DocumentResponse, status_code=201)
+@limiter.limit("20/minute")
 async def upload_document(
-    request: DocumentUploadRequest,
+    request: Request,
+    body: DocumentUploadRequest,
     current_user: User = Depends(require_role("admin", "agent")),
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Upload a new document to the knowledge base.
-    Generates a 3072-dim Gemini embedding and stores it in pgvector.
-    Admin/Agent only.
-    """
-    # 1. Generate embedding
     try:
         loop = asyncio.get_running_loop()
         embed_result = await loop.run_in_executor(
             None,
             lambda: genai.embed_content(
                 model="models/gemini-embedding-001",
-                content=request.content,
+                content=body.content,
             )
         )
         embedding_vector = embed_result["embedding"]
     except Exception as e:
-        raise HTTPException(
-            status_code=503,
-            detail=f"Embedding generation failed: {str(e)}"
-        )
+        raise HTTPException(status_code=503, detail=f"Embedding generation failed: {str(e)}")
 
-    # 2. Save Document
     doc = Document(
         organization_id=current_user.organization_id,
-        title=request.title,
-        source_url=request.source_url,
+        title=body.title,
+        source_url=body.source_url,
     )
     db.add(doc)
     await db.flush()
 
-    # 3. Save DocumentChunk with embedding
     embedding_str = "[" + ",".join(map(str, embedding_vector)) + "]"
     await db.execute(
         text("""
@@ -172,11 +176,7 @@ async def upload_document(
             VALUES
                 (gen_random_uuid(), :doc_id, :content, 0, CAST(:embedding AS vector), NOW(), NOW())
         """),
-        {
-            "doc_id": str(doc.id),
-            "content": request.content,
-            "embedding": embedding_str,
-        }
+        {"doc_id": str(doc.id), "content": body.content, "embedding": embedding_str}
     )
 
     await db.commit()
@@ -189,7 +189,6 @@ async def list_documents(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """List all documents in the organization's knowledge base."""
     result = await db.execute(
         select(Document)
         .where(Document.organization_id == current_user.organization_id)
@@ -201,21 +200,23 @@ async def list_documents(
 # ─── QUERY ────────────────────────────────────────────────────────────────────
 
 @app.post("/api/v1/query", response_model=QueryResponse)
+@limiter.limit("30/minute")
 async def ask_agent(
-    request: QueryRequest,
+    request: Request,
+    body: QueryRequest,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     try:
         agent_result = await run_support_agent(
-            query=request.query,
+            query=body.query,
             organization_id=current_user.organization_id,
         )
 
         ticket = Ticket(
             organization_id=current_user.organization_id,
             user_id=current_user.id,
-            query=request.query,
+            query=body.query,
             response=agent_result["response"],
             needs_human=agent_result["needs_human"],
         )
@@ -230,10 +231,7 @@ async def ask_agent(
             ticket_id=ticket.id,
         )
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Agent workflow failed: {str(e)}",
-        )
+        raise HTTPException(status_code=500, detail=f"Agent workflow failed: {str(e)}")
 
 
 # ─── TICKETS ──────────────────────────────────────────────────────────────────
@@ -248,5 +246,48 @@ async def get_tickets(
         .where(Ticket.organization_id == current_user.organization_id)
         .order_by(Ticket.created_at.desc())
         .limit(50)
+    )
+    return result.scalars().all()
+
+
+# ─── ADMIN ENDPOINTS ──────────────────────────────────────────────────────────
+
+@app.post("/api/v1/admin/organizations", response_model=OrganizationResponse, status_code=201)
+async def create_organization(
+    body: OrganizationCreate,
+    current_user: User = Depends(require_role("admin")),
+    db: AsyncSession = Depends(get_db),
+):
+    """Create a new tenant organization. Admin only."""
+    org = Organization(name=body.name)
+    db.add(org)
+    await db.commit()
+    await db.refresh(org)
+    return org
+
+
+@app.get("/api/v1/admin/organizations", response_model=list[OrganizationResponse])
+async def list_organizations(
+    current_user: User = Depends(require_role("admin")),
+    db: AsyncSession = Depends(get_db),
+):
+    """List all tenant organizations. Admin only."""
+    result = await db.execute(
+        select(Organization).order_by(Organization.created_at.desc())
+    )
+    return result.scalars().all()
+
+
+@app.get("/api/v1/admin/tickets/escalated", response_model=list[TicketResponse])
+async def get_escalated_tickets(
+    current_user: User = Depends(require_role("admin")),
+    db: AsyncSession = Depends(get_db),
+):
+    """List all tickets that need human review. Admin only."""
+    result = await db.execute(
+        select(Ticket)
+        .where(Ticket.needs_human == True)
+        .order_by(Ticket.created_at.desc())
+        .limit(100)
     )
     return result.scalars().all()
