@@ -103,7 +103,7 @@ async def register(request: Request, user_data: UserRegister, db: AsyncSession =
     user = User(
         organization_id=user_data.organization_id,
         email=user_data.email,
-        role=user_data.role.value,
+        role="customer",
         hashed_password=hash_password(user_data.password),
     )
     db.add(user)
@@ -357,6 +357,7 @@ async def get_escalated_tickets(
     result = await db.execute(
         select(Ticket)
         .where(Ticket.needs_human == True)
+        .where(Ticket.organization_id == current_user.organization_id)
         .order_by(Ticket.created_at.desc())
         .limit(100)
     )
